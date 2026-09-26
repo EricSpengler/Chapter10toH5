@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.h5
+*.hdf5
+*.partial
+*.ch10
+*.c10
+*.tmt
+*.zip
+build/
+dist/
+*.spec

@@ -1,0 +1,16 @@
+# Measurement definitions for ch10toh5. Lines starting with # are ignored.
+# type: 1553, arinc429 or pcm.  channel: Chapter 10 channel ID (blank = any channel of that type).
+# 1553: rt, sa, word (1 = first data word), tr (0 = BC->RT receive, 1 = RT->BC transmit, blank = either),
+#       words = how many consecutive words to join, most significant first (default 1).
+# arinc429: label in octal (e.g. 203), optional sdi and bus. Default bit field is bits 10-28 (19 bits).
+# pcm: channel, word (TMATS numbering: 1 = frame sync, 2 = first data word), optional word_interval.
+# lsb/bits pick a bit field (0 = least significant bit). encoding: unsigned, signed (two's complement),
+#       signmag (sign-magnitude) or offset (offset binary).
+# value = raw * scale + offset, or a polynomial if coefficients is given as "a0;a1;a2..."
+name,type,channel,rt,tr,sa,word,words,label,sdi,bus,word_interval,lsb,bits,encoding,scale,offset,coefficients,units,description
+EngineRPM,1553,,5,1,3,1,,,,,,,,unsigned,0.25,,,rpm,Example: RT5 transmit SA3 word 1
+FuelFlow,1553,,5,1,3,2,2,,,,,,,unsigned,0.001,,,kg/s,Example: 32-bit value in words 2-3
+PitchAngle,1553,,6,0,1,4,,,,,,0,12,signed,0.0439453125,,,deg,Example: low 12 bits of word 4
+BaroAltitude,arinc429,,,,,,,203,,,,10,19,signed,1,,,ft,Example: BNR label 203
+Airspeed,arinc429,,,,,,,206,,,,,,,0.0625,,,kt,Example: label 206
+CabinTemp,pcm,52,,,,7,,,,,,,,unsigned,,,-40;0.01,degC,Example: PCM word 7 with a polynomial

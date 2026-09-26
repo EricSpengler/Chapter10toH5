@@ -1,0 +1,122 @@
+"""Checks for engineering-unit measurements (CSV and TMATS definitions).
+
+Run:  python tests/test_measurements.py
+"""
+
+import os
+import struct
+import sys
+import tempfile
+
+import h5py
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+sys.path.insert(0, HERE)
+
+from ch10toh5.converter import convert, convert_many  # noqa: E402
+import make_sample  # noqa: E402
+from make_sample import RTC_HZ, Writer, bcd_time_doy  # noqa: E402
+
+CSV = """# name,type,... (comment lines are ignored)
+name,type,channel,rt,tr,sa,word,words,label,sdi,bus,lsb,bits,encoding,scale,offset,coefficients,units,description
+half_word2,1553,,5,0,3,2,,,,,,,,0.5,,,V,RT5 SA3 data word 2 scaled by 0.5
+rtrt_long,1553,,7,1,1,1,2,,,,,,,,,,counts,RT-RT transmit side two words
+rtrt_signed,1553,,7,,1,1,,,,,,16,signed,,,,counts,
+arinc_214,arinc429,,,,,,,214,,2,,,,2,10,,ft,
+arinc_poly,arinc429,4,,,,,,214,,,,,,,,1;0;1,x,1 + x^2
+bad row,1553,,,,,,,,,,,,,,,,,
+"""
+
+
+def pcm_file():
+    """PCM with intra-packet headers, 5-word frames, and TMATS D/C definitions."""
+    tmats = "\n".join([
+        "G\\PN:PCM demo;", "R-1\\TK1-1:3;", "R-1\\DSI-1:PCM1;", "R-1\\CDT-1:PCMIN;",
+        "P-1\\DLN:PCM1;", "P-1\\D2:96000;", "P-1\\F1:16;", "P-1\\MF1:5;", "P-1\\MF2:96;", "P-1\\MF4:32;",
+        "P-1\\MF5:11111110011010110010100001000000;",
+        "D-1\\DLN:PCM1;", "D-1\\MN-1-1:TEMP;", "D-1\\LT-1-1:WDFR;", "D-1\\WP-1-1-1:3;",
+        "D-1\\MN-1-2:PRESS;", "D-1\\LT-1-2:WDFR;", "D-1\\WP-1-2-1:2;", "D-1\\WI-1-2-1:2;",
+        "D-1\\MN-1-3:STATUS_HI;", "D-1\\WP-1-3-1:5;", "D-1\\WFM-1-3-1-1:1111000000000000;",
+        "C-1\\DCN:TEMP;", "C-1\\MN4:degC;", "C-1\\BFM:UNS;", "C-1\\DCT:COE;", "C-1\\CO\\N:1;",
+        "C-1\\CO:-40;", "C-1\\CO-1:0.5;",
+        "C-2\\DCN:PRESS;", "C-2\\MN4:kPa;", "C-2\\DCT:PTS;", "C-2\\PS\\N:2;",
+        "C-2\\PS1-1:0;", "C-2\\PS2-1:0;", "C-2\\PS1-2:1000;", "C-2\\PS2-2:100;", ""])
+    w = Writer()
+    rtc0 = 0x2000_0000
+    w.packet(0, 0x01, struct.pack("<I", 7) + tmats.encode(), rtc0)
+    w.packet(1, 0x11, struct.pack("<I", 0x11) + bcd_time_doy(10, 0, 0, 0, 0), rtc0)
+    expect = []
+    for p in range(4):
+        body = b""
+        for k in range(5):
+            n = p * 5 + k
+            ipts = rtc0 + n * 10_000
+            words = [0xFE6B, 0x2840, n * 10, 100 + n, n * 10 + 5, 0xA000 | n]
+            body += struct.pack("<QH", ipts, 0xF000) + struct.pack("<6H", *words)
+            expect.append(n)
+        csdw = (1 << 30) | (1 << 19) | (3 << 24) | (3 << 26)
+        w.packet(3, 0x09, struct.pack("<I", csdw) + body, rtc0 + p * RTC_HZ // 100)
+    return bytes(w.out), np.array(expect)
+
+
+def main():
+    tmp = tempfile.mkdtemp()
+    src = os.path.join(tmp, "sample.ch10")
+    with open(src, "wb") as fh:
+        fh.write(make_sample.build())
+    defs = os.path.join(tmp, "defs.csv")
+    with open(defs, "w") as fh:
+        fh.write(CSV)
+    out = os.path.join(tmp, "sample.h5")
+    logs = []
+    convert(src, out, year=2026, definitions=defs, log=logs.append)
+    assert any("line 8" in m for m in logs), logs          # the bad row is reported
+    with h5py.File(out, "r") as f:
+        m = f["measurements"]
+        g = m["half_word2"]
+        assert list(g["raw"][:]) == [2, 2, 2] and list(g["value"][:]) == [1.0, 1.0, 1.0]
+        assert g.attrs["units"] == "V"
+        t1553 = f["channels/ch0002_MIL-STD-1553F1/messages"]["time_ns"][:]
+        assert list(g["time_ns"][:]) == list(t1553[[0, 2, 4]])
+        assert list(m["rtrt_long/raw"][:]) == [0xAAAA5555] * 3
+        assert list(m["rtrt_signed/value"][:]) == [0xAAAA - 0x10000] * 3
+        assert list(m["arinc_214/raw"][:]) == [1, 2] * 3
+        assert list(m["arinc_214/value"][:]) == [12.0, 14.0] * 3
+        assert list(m["arinc_poly/value"][:]) == [2.0, 5.0] * 3
+        idx = m["index"][:]
+        assert len(idx) == 5 and (idx["samples"] > 0).all()
+    print("CSV definitions (1553, ARINC-429): OK")
+
+    data, n = pcm_file()
+    src2 = os.path.join(tmp, "pcm.ch10")
+    with open(src2, "wb") as fh:
+        fh.write(data)
+    out2 = os.path.join(tmp, "pcm.h5")
+    convert(src2, out2, year=2026)
+    with h5py.File(out2, "r") as f:
+        m = f["measurements"]
+        temp = m["TEMP"]
+        assert temp.attrs["units"] == "degC" and temp.attrs["defined_in"] == "tmats"
+        assert np.allclose(temp["value"][:], -40 + 0.5 * (100 + n))
+        press = m["PRESS"]
+        raw = np.sort(np.concatenate([n * 10, n * 10 + 5]))
+        assert np.allclose(np.sort(press["raw"][:]), raw)
+        assert np.allclose(np.sort(press["value"][:]), raw * 0.1)
+        assert np.all(np.diff(press["time_ns"][:]) >= 0)
+        assert list(m["STATUS_HI/raw"][:]) == [0xA] * len(n)
+        # word 3 starts 48 bits (32-bit sync + word 2) after the frame start, at 96 kbit/s
+        frame_t = f["channels/ch0003_PCMF1/messages"]["time_ns"][:]
+        assert list(temp["time_ns"][:] - frame_t) == [int(48 * 1e9 / 96000)] * len(n)
+    print("TMATS PCM definitions: OK")
+
+    both = os.path.join(tmp, "both.h5")
+    convert_many([src, src2], both, year=2026, definitions=defs)
+    with h5py.File(both, "r") as f:
+        assert "half_word2" in f["sample/measurements"] and "TEMP" in f["pcm/measurements"]
+    print("combined file measurements: OK")
+
+
+if __name__ == "__main__":
+    main()

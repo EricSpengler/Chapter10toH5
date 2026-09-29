@@ -1,7 +1,7 @@
 # ch10toh5
 
 A small desktop tool that converts IRIG 106 Chapter 10 recordings (`.ch10`, `.c10`, `.tmt`) into HDF5 (`.h5`).
-It keeps every packet in the file, of every data type. Nothing is filtered out.
+Measurements you define (from your ICD, or from the recording's own TMATS) are written at the top of the file as ready-to-use time and value arrays. A full dump of every packet, of every data type, sits underneath in `/raw` and can be left out.
 
 ![GUI](docs/gui.png)
 
@@ -13,7 +13,7 @@ You need Python 3.8 or newer with Tkinter. The python.org installers for Windows
 pip install -r requirements.txt
 python run_gui.pyw            # opens the window (on Windows you can double-click it)
 python -m ch10toh5            # same thing
-python -m ch10toh5 a.ch10 b.ch10 [-o out.h5] [--defs icd.csv] [--separate] [--year 2024] [--no-compress]   # command line
+python -m ch10toh5 a.ch10 b.ch10 [-o out.h5] [--defs icd.csv] [--no-raw] [--separate] [--year 2024] [--no-compress]   # command line
                               # several inputs -> one a_combined.h5 (use --separate for one .h5 each)
 ```
 
@@ -24,23 +24,32 @@ To build a standalone Windows `.exe`, run `pip install pyinstaller`, then `pyins
 
 ## Measurements in engineering units
 
-In addition to the raw dump, the converter can write named measurements, each stored as a time array and a value array:
+Each measurement you define is a top-level group in the h5:
 
 ```
-/measurements/<name>/time_ns   int64, ns since 1970-01-01 UTC, one per sample
-/measurements/<name>/value     float64, engineering units (attrs: units, source, description)
-/measurements/<name>/raw       the extracted bit field before conversion
-/measurements/index            one row per measurement: name, units, type, source, samples
+/<name>/time_ns        int64, ns since 1970-01-01 UTC, one per sample, in time order
+/<name>/value          float64, engineering units   (attrs: units, description, samples,
+/<name>/raw            the bit field before conversion       rate_hz_observed, sources, ...)
+/<name>/<source>/...   the same three arrays for each place the data was found
+/measurement_index     one row per measurement: units, sources, samples, rates, warnings
+/raw/...               the full packet dump (see below); untick "Include raw dump" to leave it out
 ```
+
+- **Blank channel means every channel.** A config row with no channel searches every recorder channel of that type, and the results are combined into one series. The channel column can also hold a data source name from the TMATS (`R-x\DSI`), such as `BUS-B`.
+- **The same name on several rows** means the field is found in several places. All the rows are combined into one series too.
+- **Duplicates are removed.** When the same data was recorded twice, for example the same bus on two channels, a sample that arrives from another source within half a sample period of one already kept is dropped. The count is in the `duplicates_removed` attribute. Every source is still kept separately under `/<name>/<source>/`: 1553 per channel and direction (`ch0002_RT5_T_SA3_W1`), ARINC-429 per channel and bus (`ch0006_bus4_L203`), PCM per channel (`ch0052_W7`).
+- **Real time stamps.** Every sample keeps its own time from the recording, so the rate is whatever the data really was. Nothing is repeated or interpolated. `rate_hz_observed` gives the typical rate. If the config has a `rate` column (Hz) and the data differs from it by more than 20%, the measurement gets a `rate_warning` attribute and the log says so.
 
 Definitions come from two places:
 
 - **The recording's TMATS (PCM).** When the TMATS has D-group word locations (`D-x\MN`, `WP`, `WI`, `WFM`) and C-group conversions (`C-d\DCN`, `BFM`, `DCT` = COE or PTS with coefficients or pair sets, units from `MN4`), those PCM measurements are decoded automatically. The frame layout (word length, words per frame, sync pattern, bit rate) comes from the P group, linked to the channel through `R-x\TK1` and `DSI`. Subcommutated words (frame position or interval above 1) are not decoded yet. Minor frames are found by sync pattern in throughput mode, or taken from the intra-packet headers when those are on.
 - **A definitions CSV** for 1553, ARINC-429 and PCM, normally built from your ICD. Choose it with **Definitions** in the window, or pass `--defs file.csv` on the command line. [`docs/definitions_template.csv`](docs/definitions_template.csv) documents every column and has one example row per case. For 1553, `word 1` is the first data word, whatever the message type: BC-to-RT, RT-to-BC and RT-to-RT messages are all handled. Messages with error flags are skipped.
 
-The log reports rows the CSV could not use and measurements that were not found in the recording. With several input files, each file gets its own `/<file>/measurements/`.
+The log reports rows the CSV could not use, measurements that were not found, how many sources each measurement combined, and rate mismatches. With several input files, each file gets its own `/<file>/` group with the same layout.
 
-## What goes in the HDF5 file
+## The raw dump (/raw)
+
+Everything below lives under `/raw` (and is absent if you untick **Include raw dump** or pass `--no-raw`):
 
 ```
 /                      attrs: source_file, source_size, packet_count, unparsed_bytes, time_year, ...
@@ -56,7 +65,7 @@ The log reports rows the CSV could not use and measurements that were not found 
     messages           decoded intra-packet messages, one row each (for types that have them)
 ```
 
-**Several input files in one h5:** each input gets its own top-level group named after the file, for example `/flight1/` and `/flight2/`. If two inputs have the same name, the second becomes `flight1_2`. Each group has exactly the layout shown above: `/flight1/channels/...`, `/flight1/TMATS/...`, and so on. A root `/sources` table lists each group with its source file name, size and packet count. With a single input, the layout sits at the root as shown.
+**Several input files in one h5:** each input gets its own top-level group named after the file, for example `/flight1/` and `/flight2/`. If two inputs have the same name, the second becomes `flight1_2`. Each group has exactly the layout described above: `/flight1/<measurement>/...`, `/flight1/raw/channels/...`, and so on. A root `/sources` table lists each group with its source file name, size and packet count. With a single input, the layout sits at the root as shown.
 
 Each (channel ID, data type) pair gets its own group, for example `ch0002_MIL-STD-1553F1` or `ch0000_ComputerF1_TMATS`.
 
@@ -90,7 +99,10 @@ Each (channel ID, data type) pair gets its own group, for example `ch0002_MIL-ST
 ```python
 import h5py
 f = h5py.File("flight.h5")
-g = f["channels/ch0002_MIL-STD-1553F1"]
+t, v = f["Airspeed/time_ns"][:], f["Airspeed/value"][:]     # a measurement from your config
+
+# raw 1553 words, straight from the dump
+g = f["raw/channels/ch0002_MIL-STD-1553F1"]
 msgs = g["messages"][:]
 body = g["body"]
 m = msgs[0]

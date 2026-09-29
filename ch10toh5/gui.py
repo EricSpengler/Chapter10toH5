@@ -63,6 +63,9 @@ class App(ttk.Frame):
         ttk.Button(opts, text="Browse...", command=self.pick_defs).grid(row=5, column=2, pady=(6, 0))
         ttk.Label(opts, text="optional ICD CSV (see docs/definitions_template.csv)",
                   foreground="gray").grid(row=6, column=1, sticky="w", padx=4)
+        self.include_raw = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opts, text="Include raw dump (every packet, under /raw)", variable=self.include_raw).grid(
+            row=7, column=1, sticky="w", padx=4, pady=(6, 0))
         self.compress = tk.BooleanVar(value=True)
         ttk.Checkbutton(opts, text="Compress (gzip)", variable=self.compress).grid(
             row=4, column=1, sticky="w", padx=4, pady=(6, 0))
@@ -138,6 +141,10 @@ class App(ttk.Frame):
         if defs and not os.path.isfile(defs):
             messagebox.showerror("Definitions", "That definitions file does not exist.")
             return
+        if not defs and not self.include_raw.get() and not messagebox.askyesno(
+                "Nothing selected", "The raw dump is off and no definitions file is set, so only "
+                "measurements defined in the recording's TMATS would be written. Continue?"):
+            return
         outdir = self.outdir.get().strip()
         if outdir and not os.path.isdir(outdir):
             messagebox.showerror("Output folder", "That output folder does not exist.")
@@ -154,17 +161,18 @@ class App(ttk.Frame):
         self.convert_btn.configure(state=tk.DISABLED)
         self.cancel_btn.configure(state=tk.NORMAL)
         self.worker = threading.Thread(
-            target=self.run, args=(files, out, int(year) if year else None, self.compress.get(), defs),
+            target=self.run, args=(files, out, int(year) if year else None, self.compress.get(), defs,
+                                   self.include_raw.get()),
             daemon=True)
         self.worker.start()
 
-    def run(self, files, out, year, compress, defs=None):
+    def run(self, files, out, year, compress, defs=None, include_raw=True):
         ev = self.events
         ev.put(("status", "Converting %d file%s..." % (len(files), "s" if len(files) > 1 else "")))
         ev.put(("log", "=== %d file%s -> %s" % (len(files), "s" if len(files) > 1 else "", out)))
         try:
             results = convert_many(files, out, year=year, compress=compress, cancel=self.cancel,
-                                   definitions=defs,
+                                   definitions=defs, include_raw=include_raw,
                                    progress=lambda d, t: ev.put(("progress", d / t if t else 1.0)),
                                    log=lambda m: ev.put(("log", m)))
             errors = sum(r["decode_errors"] for r in results)

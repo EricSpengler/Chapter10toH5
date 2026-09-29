@@ -19,8 +19,10 @@ def main(argv=None):
     ap.add_argument("--year", type=int, help="year for day-of-year time packets")
     ap.add_argument("--no-compress", action="store_true", help="write uncompressed datasets")
     ap.add_argument("--defs", help="CSV of measurement definitions (1553 / ARINC-429 / PCM)")
+    ap.add_argument("--no-raw", action="store_true", help="leave the raw packet dump (/raw) out of the h5")
     args = ap.parse_args(argv)
-    opts = dict(year=args.year, compress=not args.no_compress, log=print, definitions=args.defs)
+    opts = dict(year=args.year, compress=not args.no_compress, log=print, definitions=args.defs,
+                include_raw=not args.no_raw)
     if args.separate:
         if args.output:
             ap.error("--output cannot be combined with --separate")

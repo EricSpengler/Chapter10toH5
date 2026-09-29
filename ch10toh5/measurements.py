@@ -48,6 +48,7 @@ class Definition:
     pairs: list = field(default_factory=list)          # (raw, eu) table, linear interpolation
     units: str = ""
     description: str = ""
+    rate: float = None              # expected sample rate in Hz, if the config gives one
     source: str = "csv"
 
     def selector(self):
@@ -77,6 +78,17 @@ def _int(v, octal=False):
     return int(v, 0)
 
 
+def _channel(v):
+    """Channel id: a number, blank (every channel), or a data source name from the TMATS."""
+    v = (v or "").strip()
+    if not v or v.lower() in ("*", "all", "any"):
+        return None
+    try:
+        return int(v, 0)
+    except ValueError:
+        return v
+
+
 def _float(v, default):
     v = (v or "").strip()
     return float(v) if v else default
@@ -99,7 +111,7 @@ def load_csv(path):
                 if not row.get("name", "").strip() or kind is None:
                     raise ValueError("needs a name and a type of 1553, arinc429 or pcm")
                 d = Definition(
-                    name=row["name"].strip(), kind=kind, channel=_int(row.get("channel")),
+                    name=row["name"].strip(), kind=kind, channel=_channel(row.get("channel")),
                     rt=_int(row.get("rt")), tr=_int(row.get("tr")), sa=_int(row.get("sa")),
                     word=_int(row.get("word")), words=_int(row.get("words")) or 1,
                     label=_int(row.get("label"), octal=True), sdi=_int(row.get("sdi")), bus=_int(row.get("bus")),
@@ -108,15 +120,16 @@ def load_csv(path):
                     encoding=(row.get("encoding", "").strip().lower() or "unsigned"),
                     scale=_float(row.get("scale"), 1.0), offset=_float(row.get("offset"), 0.0),
                     coefficients=[float(c) for c in re.split(r"[;\s]+", row.get("coefficients", "").strip()) if c],
-                    units=row.get("units", "").strip(), description=row.get("description", "").strip())
+                    units=row.get("units", "").strip(), description=row.get("description", "").strip(),
+                    rate=_float(row.get("rate") or row.get("rate_hz") or row.get("frequency"), None))
                 if d.encoding not in ENCODINGS:
                     raise ValueError("encoding must be one of " + ", ".join(ENCODINGS))
                 if kind == "1553" and None in (d.rt, d.sa, d.word):
                     raise ValueError("1553 rows need rt, sa and word")
                 if kind == "arinc429" and d.label is None:
                     raise ValueError("arinc429 rows need a label")
-                if kind == "pcm" and None in (d.channel, d.word):
-                    raise ValueError("pcm rows need channel and word")
+                if kind == "pcm" and d.word is None:
+                    raise ValueError("pcm rows need a word")
                 defs.append(d)
             except ValueError as exc:
                 problems.append("line %d: %s" % (n, exc))
@@ -274,7 +287,8 @@ def _channels(root, data_type, channel):
 
 
 def extract_1553(root, d):
-    times, raws = [], []
+    """One series per recorder channel and transfer direction (R / T)."""
+    series = []
     for g in _channels(root, 0x19, d.channel):
         if "messages" not in g or not len(g["messages"]):
             continue
@@ -290,23 +304,27 @@ def extract_1553(root, d):
         # index of data word 1 inside the message: after cmd (+status for transmit, +cmd2+status for RT-RT)
         first = np.where(rt2, 3, np.where(m["transmit"] == 1, 2, 1))
         idx = first + d.word - 1
-        ok = (normal | rx | tx) & sa_ok & (m["message_error"] == 0) & \
-             ((idx + d.words) * 2 <= m["data_length"])
-        if not ok.any():
-            continue
-        starts = (m["data_offset"][ok] + 2 * idx[ok]).astype(np.int64)
-        b = _gather(g["body"], starts, 2 * d.words)
-        w = b.view("<u2").astype(np.uint64)
-        raw = np.zeros(len(starts), dtype=np.uint64)
-        for k in range(d.words):
-            raw = (raw << np.uint64(16)) | w[:, k]
-        times.append(m["time_ns"][ok])
-        raws.append(raw)
-    return _join(times, raws), 0, 16 * d.words
+        valid = sa_ok & (m["message_error"] == 0) & ((idx + d.words) * 2 <= m["data_length"])
+        # the defined RT receives (BC->RT, or receiving side of RT->RT) / transmits
+        direction = {"R": valid & ((normal & (m["transmit"] == 0)) | rx),
+                     "T": valid & ((normal & (m["transmit"] == 1)) | tx)}
+        for dname, ok in direction.items():
+            if not ok.any():
+                continue
+            starts = (m["data_offset"][ok] + 2 * idx[ok]).astype(np.int64)
+            b = _gather(g["body"], starts, 2 * d.words)
+            w = b.view("<u2").astype(np.uint64)
+            raw = np.zeros(len(starts), dtype=np.uint64)
+            for k in range(d.words):
+                raw = (raw << np.uint64(16)) | w[:, k]
+            label = "ch%04d_RT%d_%s_SA%d_W%d" % (int(g.attrs["channel_id"]), d.rt, dname, d.sa, d.word)
+            series.append((label, m["time_ns"][ok], raw))
+    return series, 0, 16 * d.words
 
 
 def extract_arinc(root, d):
-    times, raws = [], []
+    """One series per recorder channel and ARINC bus."""
+    series = []
     for g in _channels(root, 0x38, d.channel):
         if "messages" not in g or not len(g["messages"]):
             continue
@@ -316,9 +334,11 @@ def extract_arinc(root, d):
             ok &= m["sdi"] == d.sdi
         if d.bus is not None:
             ok &= m["bus"] == d.bus
-        times.append(m["time_ns"][ok])
-        raws.append(m["word"][ok].astype(np.uint64))
-    return _join(times, raws), 10, 29      # default field: data bits 11-29 (19 bits incl. sign)
+        for bus in np.unique(m["bus"][ok]):
+            sel = ok & (m["bus"] == bus)
+            label = "ch%04d_bus%d_L%03d" % (int(g.attrs["channel_id"]), int(bus), d.label)
+            series.append((label, m["time_ns"][sel], m["word"][sel].astype(np.uint64)))
+    return series, 10, 29      # default field: data bits 11-29 (19 bits incl. sign)
 
 
 def _join(times, raws):
@@ -436,13 +456,13 @@ def _frames_throughput(g, fmt, csdw, max_bits=1 << 27):
 
 def extract_pcm(root, defs, formats, log):
     """All PCM definitions for one channel, sharing one pass over its frames."""
-    results = {d.name: ([], []) for d in defs}
+    results = {id(d): ([], []) for d in defs}
     cid = defs[0].channel
     fmt = formats.get(cid)
     if fmt is None:
         if any(True for _g in _channels(root, 0x09, cid)):
             log("PCM channel %s: no frame format in TMATS, so its measurements are skipped." % cid)
-        return {d.name: (np.zeros(0, np.int64), np.zeros(0, np.uint64)) for d in defs}, fmt
+        return {id(d): (np.zeros(0, np.int64), np.zeros(0, np.uint64)) for d in defs}, fmt
     for g in _channels(root, 0x09, cid):
         pk = g["packets"]
         if not len(pk):
@@ -463,19 +483,23 @@ def extract_pcm(root, defs, formats, log):
                     if b0 + wl > bits.shape[1]:
                         continue
                     word = (bits[:, b0:b0 + wl].astype(np.uint64) * weights[64 - wl:]).sum(axis=1).astype(np.uint64)
-                    results[d.name][0].append(t + int(b0 * ns_per_bit))
-                    results[d.name][1].append(word)
+                    results[id(d)][0].append(t + int(b0 * ns_per_bit))
+                    results[id(d)][1].append(word)
     out = {}
     for d in defs:
-        t, r = _join(*results[d.name])
-        out[d.name] = (t, r)
+        out[id(d)] = _join(*results[id(d)])
     return out, fmt
 
 
 # ---------------------------------------------------------------- writer
 
+RESERVED = {"raw", "sources", "measurement_index"}
+
+
 def _safe(name, used):
     base = re.sub(r"[/\\.]+", "_", name).strip() or "measurement"
+    if base in RESERVED:
+        base += "_m"
     n, k = base, 2
     while n in used:
         n, k = "%s_%d" % (base, k), k + 1
@@ -483,8 +507,72 @@ def _safe(name, used):
     return n
 
 
-def write_measurements(root, defs, tmats_pairs, comp, log):
-    """Evaluate every definition against the converted group and write the results."""
+def observed_rate(t):
+    """Typical sample rate in Hz from the median spacing of the time stamps."""
+    t = t[t >= 0]
+    if len(t) < 2:
+        return 0.0
+    dt = np.diff(np.sort(t))
+    dt = dt[dt > 0]
+    return float(1e9 / np.median(dt)) if len(dt) else 0.0
+
+
+def combine(series):
+    """Merge the per-source series of one measurement into a single time-ordered series.
+
+    A sample is dropped when another source already has a sample less than
+    half a sample period earlier: the same data recorded twice (for example
+    the same bus on two recorder channels) is kept once. Returns
+    (time_ns, value, raw, duplicates_removed).
+    """
+    if not series:
+        z = np.zeros(0)
+        return z.astype(np.int64), z, z.astype(np.int64), 0
+    t = np.concatenate([x[2] for x in series]).astype(np.int64)
+    v = np.concatenate([x[4] for x in series]).astype(np.float64)
+    r = np.concatenate([x[3] for x in series]).astype(np.int64)
+    src = np.concatenate([np.full(len(x[2]), k) for k, x in enumerate(series)])
+    order = np.lexsort((src, t))
+    t, v, r, src = t[order], v[order], r[order], src[order]
+    if len(series) > 1 and len(t) > 1:
+        rates = [observed_rate(x[2]) for x in series]
+        periods = [1e9 / q for q in rates if q > 0]
+        tol = 0.5 * min(periods) if periods else 0.0
+        dup = np.zeros(len(t), dtype=bool)
+        dup[1:] = (src[1:] != src[:-1]) & (np.diff(t) <= tol)
+        keep = ~dup
+        return t[keep], v[keep], r[keep], int(dup.sum())
+    return t, v, r, 0
+
+
+def resolve_channels(defs, tmats_pairs, log):
+    """Allow the channel column to name a data source from the TMATS instead of a number."""
+    tm = _tm_dict(tmats_pairs)
+    by_name = {}
+    for k, v in tm.items():
+        m = re.match(r"^R-(\d+)\\TK1-(\d+)$", k)
+        if m:
+            dsi = tm.get("R-%s\\DSI-%s" % m.groups(), "").strip().lower()
+            if dsi:
+                by_name[dsi] = int(v)
+    for d in defs:
+        if isinstance(d.channel, str):
+            cid = by_name.get(d.channel.strip().lower())
+            if cid is None:
+                log("Measurement %s: channel %r is not a number or a data source in the TMATS." % (d.name, d.channel))
+            d.channel = cid if cid is not None else -1
+
+
+def write_measurements(src, out, defs, tmats_pairs, comp, log):
+    """Evaluate every definition against the raw data in src and write the results to out.
+
+    Every measurement name becomes a top-level group ``out/<name>`` whose
+    ``time_ns``/``value``/``raw`` combine every place the data was found (all
+    channels when the channel column is blank, and every row when a name is
+    defined more than once), in time order with duplicate copies removed. Each
+    place is also kept on its own in ``out/<name>/<source>/`` with its real
+    time stamps.
+    """
     all_defs = list(defs)
     formats = pcm_formats(tmats_pairs) if tmats_pairs else {}
     if tmats_pairs:
@@ -494,51 +582,107 @@ def write_measurements(root, defs, tmats_pairs, comp, log):
         all_defs += from_tm
     if not all_defs:
         return 0
-    out = root.create_group("measurements")
-    out.attrs["note"] = ("Each measurement has time_ns (ns since 1970 UTC), value (engineering units) "
-                         "and raw (the extracted bit field before conversion).")
-    used, rows = set(), []
 
+    resolve_channels(all_defs, tmats_pairs or [], log)
+    pcm_channels = sorted(int(g.attrs["channel_id"]) for g in _channels(src, 0x09, None))
     pcm_by_channel = {}
     for d in all_defs:
         if d.kind == "pcm":
-            pcm_by_channel.setdefault(d.channel, []).append(d)
-    pcm_results = {}
+            for cid in ([d.channel] if d.channel is not None else pcm_channels):
+                pcm_by_channel.setdefault(cid, []).append(d)
+    pcm_results = {}          # (id(definition), channel) -> (t, raw)
     for cid, group in pcm_by_channel.items():
-        res, _fmt = extract_pcm(root, group, formats, log)
-        pcm_results.update({id(d): res[d.name] for d in group})
+        shadow = [Definition(**{**d.__dict__, "channel": cid}) for d in group]
+        res, _fmt = extract_pcm(src, shadow, formats, log)
+        for d, sd in zip(group, shadow):
+            pcm_results[(id(d), cid)] = res[id(sd)]
 
+    by_name = {}
     for d in all_defs:
-        if d.kind == "1553":
-            (t, raw), lsb0, width = extract_1553(root, d)
-        elif d.kind == "arinc429":
-            (t, raw), lsb0, width = extract_arinc(root, d)
-        else:
-            (t, raw) = pcm_results[id(d)]
-            fmt = formats.get(d.channel) or {}
-            lsb0, width = 0, fmt.get("word_bits", 16) if d.word != 1 else fmt.get("sync_bits", 16)
-        field_raw = _field(raw, d, lsb0, width)
-        value = to_eu(field_raw, d)
-        name = _safe(d.name, used)
-        g = out.create_group(name)
-        kw = comp if len(t) > 1024 else {}
-        g.create_dataset("time_ns", data=t.astype(np.int64), **kw)
-        g.create_dataset("value", data=value.astype(np.float64), **kw)
-        g.create_dataset("raw", data=field_raw.astype(np.int64), **kw)
-        a = g.attrs
-        a["name"] = d.name
-        a["units"] = d.units
-        a["type"] = d.kind
-        a["source"] = d.selector()
-        a["defined_in"] = d.source
-        a["description"] = d.description
-        a["samples"] = len(t)
-        rows.append((name, d.units, d.kind, d.selector(), d.source, len(t)))
-        if not len(t):
-            log("Measurement %s (%s): no matching data in this file." % (d.name, d.selector()))
+        by_name.setdefault(d.name, []).append(d)
+
     st = h5py.string_dtype("utf-8")
-    out.create_dataset("index", data=np.array(rows, dtype=[
-        ("name", st), ("units", st), ("type", st), ("source", st), ("defined_in", st), ("samples", "u8")]))
-    found = sum(1 for r in rows if r[-1])
-    log("Measurements: %d defined, %d found in this file." % (len(rows), found))
-    return len(rows)
+    used, rows = set(RESERVED), []
+    for mname, mdefs in by_name.items():
+        series = []            # (label, definition, t, field_raw, value)
+        for k, d in enumerate(mdefs):
+            if d.kind == "1553":
+                found, lsb0, width = extract_1553(src, d)
+            elif d.kind == "arinc429":
+                found, lsb0, width = extract_arinc(src, d)
+            else:
+                found, lsb0, width = [], 0, 16
+                for (did, cid), (t, raw) in pcm_results.items():
+                    if did == id(d) and len(t):
+                        fmt = formats.get(cid) or {}
+                        width = fmt.get("word_bits", 16) if d.word != 1 else fmt.get("sync_bits", 16)
+                        found.append(("ch%04d_W%d" % (cid, d.word), t, raw))
+            if not found:
+                log("Measurement %s (%s): no matching data in this file." % (mname, d.selector()))
+            for label, t, raw in found:
+                if len(mdefs) > 1:
+                    label = "def%d_%s" % (k + 1, label)
+                order = np.argsort(t, kind="stable")
+                t, raw = t[order], raw[order]
+                field_raw = _field(raw, d, lsb0, width)
+                series.append((label, d, t, field_raw, to_eu(field_raw, d)))
+
+        gname = _safe(mname, used)
+        g = out.create_group(gname)
+        first = mdefs[0]
+        t, value, raw, dups = combine(series)
+        kw = comp if len(t) > 1024 else {}
+        g.create_dataset("time_ns", data=t, **kw)
+        g.create_dataset("value", data=value, **kw)
+        g.create_dataset("raw", data=raw, **kw)
+        rate = observed_rate(t)
+        a = g.attrs
+        a["name"] = mname
+        a["units"] = first.units
+        a["description"] = first.description
+        a["type"] = first.kind
+        a["definitions"] = len(mdefs)
+        a["samples"] = len(t)
+        a["rate_hz_observed"] = rate
+        a["sources"] = [x[0] for x in series]
+        a["duplicates_removed"] = dups
+        warn = ""
+        cfg_rate = next((d.rate for d in mdefs if d.rate), None)
+        if cfg_rate:
+            a["rate_hz_config"] = cfg_rate
+            if rate and abs(rate - cfg_rate) > 0.2 * cfg_rate:
+                warn = ("config says %g Hz but the data arrives at %.3g Hz; samples are written at the "
+                        "real rate with their own time stamps" % (cfg_rate, rate))
+                a["rate_warning"] = warn
+                log("Measurement %s: %s." % (mname, warn))
+        if not series:
+            a["note"] = "No matching data in this file."
+        labels = set()
+        for label, d, st_, field_raw, val in series:
+            base, n = label, 2
+            while label in labels:
+                label, n = "%s_%d" % (base, n), n + 1
+            labels.add(label)
+            s_ = g.create_group(label)
+            kw = comp if len(st_) > 1024 else {}
+            s_.create_dataset("time_ns", data=st_.astype(np.int64), **kw)
+            s_.create_dataset("value", data=val.astype(np.float64), **kw)
+            s_.create_dataset("raw", data=field_raw.astype(np.int64), **kw)
+            b = s_.attrs
+            b["units"] = d.units
+            b["source"] = d.selector()
+            b["defined_in"] = d.source
+            b["samples"] = len(st_)
+            b["rate_hz_observed"] = observed_rate(st_)
+        if len(series) > 1:
+            log("Measurement %s: combined %d sources (%s), %d duplicate samples removed." % (
+                mname, len(series), ", ".join(x[0] for x in series), dups))
+        rows.append((gname, first.units, first.kind, "; ".join(x[0] for x in series), len(series),
+                     len(t), rate, cfg_rate or 0.0, dups, warn))
+
+    out.create_dataset("measurement_index", data=np.array(rows, dtype=[
+        ("name", st), ("units", st), ("type", st), ("sources", st), ("source_count", "u4"), ("samples", "u8"),
+        ("rate_hz_observed", "f8"), ("rate_hz_config", "f8"), ("duplicates_removed", "u8"), ("warning", st)]))
+    found = sum(1 for r in rows if r[5])
+    log("Measurements: %d defined, %d found in this file." % (len(by_name), found))
+    return len(by_name)

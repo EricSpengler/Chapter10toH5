@@ -252,9 +252,10 @@ def prescan_time(path, year):
 # ---------------------------------------------------------------- conversion
 
 def convert(in_path, out_path, year=None, compress=True, progress=None, cancel=None, log=None,
-            definitions=None):
+            definitions=None, include_raw=True):
     """Convert one Chapter 10 file to HDF5; its content sits at the file root."""
-    return convert_many([in_path], out_path, year, compress, progress, cancel, log, definitions)[0]
+    return convert_many([in_path], out_path, year, compress, progress, cancel, log, definitions,
+                        include_raw)[0]
 
 
 def default_output(in_paths, outdir=None):
@@ -279,12 +280,16 @@ def source_group_names(in_paths):
 
 
 def convert_many(in_paths, out_path, year=None, compress=True, progress=None, cancel=None, log=None,
-                 definitions=None):
+                 definitions=None, include_raw=True):
     """Convert Chapter 10 files into a single HDF5 file. Returns one summary dict per input.
 
-    With one input, its content is written at the file root. With several,
-    each input gets its own top-level group (named after the file) holding the
-    same layout, and the root lists them in /sources.
+    Measurements (from the definitions CSV and the TMATS) are top-level groups,
+    one per measurement name. The full dump of the recording goes under /raw,
+    or is left out when include_raw is False.
+
+    With one input, this layout is at the file root. With several, each input
+    gets its own top-level group (named after the file) holding the same
+    layout, and the root lists them in /sources.
 
     progress(done_bytes, total_bytes) covers all inputs; cancel is an optional
     threading.Event; log(str) receives human-readable messages. definitions is
@@ -309,7 +314,8 @@ def convert_many(in_paths, out_path, year=None, compress=True, progress=None, ca
             for path, size, name in zip(in_paths, sizes, names):
                 target = h5 if len(in_paths) == 1 else h5.create_group(name)
                 sub = (lambda d, t, base=done: progress(base + d, total)) if progress else None
-                res = _convert_one(path, target, size, year, comp, sub, cancel, log, defs)
+                res = _convert_one(path, target, size, year, comp, sub, cancel, log, defs,
+                                   include_raw, tmp_path + ".raw%d" % len(results))
                 res["group"] = target.name
                 results.append(res)
                 done += size
@@ -334,7 +340,8 @@ def convert_many(in_paths, out_path, year=None, compress=True, progress=None, ca
     return results
 
 
-def _convert_one(in_path, h5, size, year, comp, progress, cancel, log, defs=()):
+def _convert_one(in_path, h5, size, year, comp, progress, cancel, log, defs=(), include_raw=True,
+                 scratch_path=None):
     t0 = time.time()
     log("Scanning time packets in %s..." % os.path.basename(in_path))
     refs, year, year_known = prescan_time(in_path, year)
@@ -345,10 +352,25 @@ def _convert_one(in_path, h5, size, year, comp, progress, cancel, log, defs=()):
     else:
         log("No usable time packets: time_ns columns will be -1.")
     groups = {}
-    n_packets, gap_rows = _write(in_path, h5, size, year, year_known, tb, comp,
-                                 groups, progress, cancel, log)
-    pairs = [(k.decode(), v.decode()) for k, v in h5["TMATS/attributes"][:]] if "TMATS/attributes" in h5 else []
-    n_meas = write_measurements(h5, defs, pairs, comp, log)
+    # The raw dump is always built (measurements are read from it); when it is not
+    # wanted in the output it goes to a scratch file that is deleted afterwards.
+    scratch = None if include_raw else h5py.File(scratch_path, "w")
+    try:
+        raw = h5.create_group("raw") if include_raw else scratch
+        n_packets, gap_rows = _write(in_path, raw, size, year, year_known, tb,
+                                     comp if include_raw else {}, groups, progress, cancel, log)
+        for k, v in raw.attrs.items():
+            h5.attrs[k] = v
+        if include_raw:
+            h5.attrs["raw_dump"] = "/raw holds every packet of the recording"
+        pairs = [(k.decode(), v.decode()) for k, v in raw["TMATS/attributes"][:]] if "TMATS/attributes" in raw else []
+        n_meas = write_measurements(raw, h5, defs, pairs, comp, log)
+    finally:
+        if scratch is not None:
+            scratch.close()
+            os.remove(scratch_path)
+    if not include_raw and not n_meas:
+        log("Warning: the raw dump was left out and no measurements are defined, so this file is nearly empty.")
     elapsed = time.time() - t0
     log("Done: %d packets in %d channel groups, %.1f s." % (n_packets, len(groups), elapsed))
     return {
@@ -478,7 +500,7 @@ def _write(in_path, h5, size, year, year_known, tb, comp, groups, progress, canc
         # Summary table
         summary = []
         for (cid, dtp), g in sorted(groups.items()):
-            summary.append((cid, dtp, g.decoder.name, "/channels/" + g.name, len(g.packets),
+            summary.append((cid, dtp, g.decoder.name, g.h5.name, len(g.packets),
                             len(g.messages) if g.messages is not None else 0, g.body.size,
                             g.decode_errors))
         h5.create_dataset("summary", data=np.array(summary, dtype=[

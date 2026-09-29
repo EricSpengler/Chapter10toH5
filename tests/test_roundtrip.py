@@ -25,7 +25,7 @@ def check_lossless(ch10_path, h5_path, group="/"):
     raw = open(ch10_path, "rb").read()
     covered = np.zeros(len(raw), dtype=bool)
     with h5py.File(h5_path, "r") as h5:
-        f = h5[group]
+        f = h5[group]["raw"]
         for name, g in f["channels"].items():
             pk = g["packets"][:]
             body = g["body"][:].tobytes()
@@ -53,7 +53,7 @@ def check_lossless(ch10_path, h5_path, group="/"):
 def check_synthetic(h5_path, group="/"):
     exp = make_sample.EXPECT
     with h5py.File(h5_path, "r") as h5:
-        f = h5[group]
+        f = h5[group]["raw"]
         ch = f["channels"]
         assert f["TMATS/text_000"][()].decode() == exp["tmats"]
         assert dict((k.decode(), v.decode()) for k, v in f["TMATS/attributes"][:])["R-1\\CDT-1"] == "1553IN"

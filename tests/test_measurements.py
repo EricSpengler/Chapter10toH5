@@ -81,6 +81,97 @@ def bus_file():
     return bytes(w.out)
 
 
+def commutated_file(with_counter=True):
+    """PCM with a 4-minor-frame major frame: a subframe ID counter in word 2, a supercommutated
+    measurement in words 3 and 5, and a subcommutated word 4 whose meaning changes each minor frame.
+    Minor frames arrive every 1 ms (1000 Hz)."""
+    tm = ["G\\PN:commutation demo;", "R-1\\TK1-1:3;", "R-1\\DSI-1:PCM1;", "R-1\\CDT-1:PCMIN;",
+          "P-1\\DLN:PCM1;", "P-1\\D2:1000000;", "P-1\\F1:16;", "P-1\\MF1:6;", "P-1\\MF2:112;", "P-1\\MF4:32;",
+          "P-1\\MF5:11111110011010110010100001000000;", "P-1\\MF\\N:4;"]
+    if with_counter:
+        tm += ["P-1\\ISF\\N:1;", "P-1\\ISF2-1:ID;", "P-1\\IDC1-1:2;", "P-1\\IDC3-1:15;", "P-1\\IDC4-1:2;",
+               "P-1\\IDC6-1:0;", "P-1\\IDC10-1:INC;"]
+    tm += ["D-1\\DLN:PCM1;",
+           # supercommutated: words 3 and 5 of every minor frame (TMATS 5-index form)
+           "D-1\\MN-1-1:SUPER;", "D-1\\LT-1-1:WDFR;", "D-1\\WP-1-1-1-1:3;", "D-1\\WI-1-1-1-1:2;",
+           "D-1\\EWP-1-1-1-1:5;",
+           # subcommutated: word 4 of minor frame 2 only
+           "D-1\\MN-1-2:SUB2;", "D-1\\LT-1-2:WDFR;", "D-1\\WP-1-2-1:4;", "D-1\\FP-1-2-1:2;",
+           # subcommutated: word 4 of minor frames 1 and 3
+           "D-1\\MN-1-3:SUB13;", "D-1\\LT-1-3:WDFR;", "D-1\\WP-1-3-1:4;", "D-1\\FP-1-3-1:1;",
+           "D-1\\FI-1-3-1:2;",
+           # the same data as SUPER, listed as two separate locations
+           "D-1\\MN-1-4:MULTI;", "D-1\\LT-1-4:WDFR;", "D-1\\MML\\N-1-4:2;", "D-1\\WP-1-4-1:3;",
+           "D-1\\WP-1-4-2:5;", ""]
+    w = Writer()
+    rtc0 = 0x2000_0000
+    w.packet(0, 0x01, struct.pack("<I", 7) + "\n".join(tm).encode(), rtc0)
+    w.packet(1, 0x11, struct.pack("<I", 0x11) + bcd_time_doy(10, 0, 0, 0, 0), rtc0)
+    per_packet, n_frames = 4, 40
+    for p in range(n_frames // per_packet):
+        body = b""
+        for k in range(per_packet):
+            n = p * per_packet + k
+            frame = n % 4 + 1
+            words = [0xFE6B, 0x2840, 0xAB00 | (n % 4), 1000 + n, 100 * frame + n, 2000 + n, 7]
+            body += struct.pack("<QH", rtc0 + n * RTC_HZ // 1000, 0xF000) + struct.pack("<7H", *words)
+        csdw = (1 << 30) | (1 << 19) | (3 << 24) | (3 << 26)
+        w.packet(3, 0x09, struct.pack("<I", csdw) + body, rtc0 + p * per_packet * RTC_HZ // 1000)
+    return bytes(w.out), np.arange(n_frames)
+
+
+def check_commutation(tmp):
+    from ch10toh5.measurements import observed_rate
+    data, n = commutated_file()
+    src = os.path.join(tmp, "commutated.ch10")
+    with open(src, "wb") as fh:
+        fh.write(data)
+    defs = os.path.join(tmp, "commutated.csv")
+    with open(defs, "w") as fh:
+        fh.write("name,type,channel,word,frame,frame_interval\n"
+                 "CSV_SUB3,pcm,,4,3,\n"          # word 4 of minor frame 3, counter from TMATS
+                 "CSV_EVERY,pcm,,4,,\n")         # no frame given: word 4 of every minor frame
+    out = os.path.join(tmp, "commutated.h5")
+    logs = []
+    convert(src, out, year=2026, definitions=defs, log=logs.append)
+    with h5py.File(out, "r") as f:
+        frame_rate = observed_rate(f["raw/channels/ch0003_PCMF1/messages"]["time_ns"][:])
+        assert abs(frame_rate - 1000) < 1, frame_rate
+        sup = f["SUPER"]
+        assert sorted(sup["raw"][:]) == sorted(list(1000 + n) + list(2000 + n))
+        assert len(sup["raw"]) == 2 * len(n)
+        assert list(f["SUB2/raw"][:]) == [200 + i for i in n if i % 4 == 1]
+        assert abs(f["SUB2"].attrs["rate_hz_observed"] - 250) < 1
+        # supercommutated: twice the minor frame rate; subcommutated: a quarter or half of it
+        assert abs(sup.attrs["rate_hz_observed"] - 2000) < 30, sup.attrs["rate_hz_observed"]
+        assert abs(f["SUB13"].attrs["rate_hz_observed"] - 500) < 10
+        assert abs(f["CSV_SUB3"].attrs["rate_hz_observed"] - 250) < 5
+        assert list(f["SUB13/raw"][:]) == [100 * (i % 4 + 1) + i for i in n if i % 4 in (0, 2)]
+        assert list(f["CSV_SUB3/raw"][:]) == [300 + i for i in n if i % 4 == 2]
+        assert len(f["CSV_EVERY/raw"]) == len(n)
+        assert sorted(f["MULTI/raw"][:]) == sorted(sup["raw"][:])
+    print("PCM supercommutation and subcommutation from TMATS and CSV: OK")
+
+    # no counter in the TMATS: subcommutated words are skipped unless the CSV names the counter
+    data, n = commutated_file(with_counter=False)
+    src = os.path.join(tmp, "nocounter.ch10")
+    with open(src, "wb") as fh:
+        fh.write(data)
+    with open(defs, "w") as fh:
+        fh.write("name,type,channel,word,frame,sfid_word,sfid_lsb,sfid_bits,frames\n"
+                 "CSV_SUB4,pcm,3,4,4,2,0,2,4\n"
+                 "CSV_NOCOUNTER,pcm,3,4,4,,,,\n")
+    out = os.path.join(tmp, "nocounter.h5")
+    logs = []
+    convert(src, out, year=2026, definitions=defs, log=logs.append)
+    with h5py.File(out, "r") as f:
+        assert list(f["CSV_SUB4/raw"][:]) == [400 + i for i in n if i % 4 == 3]
+        assert len(f["CSV_NOCOUNTER/raw"]) == 0 and len(f["SUB2/raw"]) == 0
+        assert len(f["SUPER/raw"]) == 2 * len(n)
+    assert any("CSV_NOCOUNTER" in m and "subframe ID counter" in m for m in logs), logs
+    print("subframe ID counter from the CSV, and skip without one: OK")
+
+
 def main():
     tmp = tempfile.mkdtemp()
     src = os.path.join(tmp, "sample.ch10")
@@ -169,6 +260,8 @@ def main():
         assert "half_word2" in f["sample"] and "TEMP" in f["pcm"] and "raw" in f["pcm"]
         assert list(f["pcm/temp_any_channel/raw"][:]) == list(100 + n)
     print("combined file measurements: OK")
+
+    check_commutation(tmp)
 
 
 if __name__ == "__main__":

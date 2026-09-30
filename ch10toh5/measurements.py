@@ -4,8 +4,9 @@ frame words into named time/value arrays.
 Definitions come from two places:
 
 * a CSV file (usually built from the ICD), one row per measurement:
-  ``name,type,channel,rt,tr,sa,word,words,label,sdi,bus,word_interval,lsb,bits,
-  encoding,scale,offset,coefficients,units,description``
+  ``name,type,channel,rt,tr,sa,word,words,label,sdi,bus,word_interval,end_word,
+  frame,frame_interval,end_frame,sfid_word,sfid_lsb,sfid_bits,sfid_first,frames,
+  lsb,bits,encoding,scale,offset,coefficients,units,description,rate``
   (only ``name`` and ``type`` plus the selector columns for that type are required)
 * the recording's own TMATS, for PCM: D-group word locations and C-group
   conversions, where the TMATS carries them.
@@ -38,7 +39,13 @@ class Definition:
     label: int = None               # ARINC-429 label, written in octal digits (e.g. 203)
     sdi: int = None
     bus: int = None
-    word_interval: int = 0          # PCM: repeat every N words within the minor frame
+    word_interval: int = 0          # PCM supercommutation: repeat every N words within the minor frame
+    end_word: int = None            # PCM: last word position of a supercommutated word (blank = frame end)
+    frame: int = None               # PCM subcommutation: minor frame number in the major frame (1 = first)
+    frame_interval: int = 0         # PCM: repeat every N minor frames (0 = only in `frame`)
+    end_frame: int = None           # PCM: last minor frame (blank = end of the major frame)
+    locations: list = field(default_factory=list)      # PCM: several (word, frame) locations, from TMATS
+    sfid: dict = field(default_factory=dict)           # PCM: subframe ID counter settings from the CSV
     lsb: int = None                 # bit field: lowest bit (0 = least significant)
     bits: int = None                # bit field: width
     encoding: str = "unsigned"
@@ -62,6 +69,16 @@ class Definition:
                 s += " bus %d" % self.bus
         else:
             s = "word %s" % self.word + (" every %d" % self.word_interval if self.word_interval else "")
+            if self.end_word:
+                s += " to %d" % self.end_word
+            if self.frame is not None:
+                s += " frame %d" % self.frame
+                if self.frame_interval:
+                    s += " every %d" % self.frame_interval
+                if self.end_frame:
+                    s += " to %d" % self.end_frame
+            if len(self.locations) > 1:
+                s += " (+%d more locations)" % (len(self.locations) - 1)
         if self.channel is not None:
             s = "channel %d %s" % (self.channel, s)
         return s
@@ -115,7 +132,12 @@ def load_csv(path):
                     rt=_int(row.get("rt")), tr=_int(row.get("tr")), sa=_int(row.get("sa")),
                     word=_int(row.get("word")), words=_int(row.get("words")) or 1,
                     label=_int(row.get("label"), octal=True), sdi=_int(row.get("sdi")), bus=_int(row.get("bus")),
-                    word_interval=_int(row.get("word_interval")) or 0,
+                    word_interval=_int(row.get("word_interval")) or 0, end_word=_int(row.get("end_word")),
+                    frame=_int(row.get("frame") or row.get("minor_frame") or row.get("subframe")),
+                    frame_interval=_int(row.get("frame_interval")) or 0, end_frame=_int(row.get("end_frame")),
+                    sfid={k: _int(row.get(c)) for k, c in (("word", "sfid_word"), ("lsb", "sfid_lsb"),
+                          ("bits", "sfid_bits"), ("first_value", "sfid_first"), ("frames", "frames"))
+                          if _int(row.get(c)) is not None},
                     lsb=_int(row.get("lsb")), bits=_int(row.get("bits")),
                     encoding=(row.get("encoding", "").strip().lower() or "unsigned"),
                     scale=_float(row.get("scale"), 1.0), offset=_float(row.get("offset"), 0.0),
@@ -130,6 +152,8 @@ def load_csv(path):
                     raise ValueError("arinc429 rows need a label")
                 if kind == "pcm" and d.word is None:
                     raise ValueError("pcm rows need a word")
+                if kind == "pcm" and d.frame is not None and d.frame < 1:
+                    raise ValueError("frame counts from 1 (the first minor frame of the major frame)")
                 defs.append(d)
             except ValueError as exc:
                 problems.append("line %d: %s" % (n, exc))
@@ -173,11 +197,34 @@ def pcm_formats(pairs):
                 "sync_bits": int(tm["P-%s\\MF4" % p]),
                 "sync": tm.get("P-%s\\MF5" % p, "").strip(),
                 "bit_rate": float(tm.get("P-%s\\D2" % p, "0") or 0),
+                "frames": int(tm.get("P-%s\\MF\\N" % p, "1") or 1),
             }
+            fmt["sfid"] = _tmats_sfid(tm, p, fmt)
         except (KeyError, ValueError):
             continue
         out[int(v)] = fmt
     return out
+
+
+def _tmats_sfid(tm, p, fmt):
+    """Subframe ID counter from P-d\\IDC keys: which word holds it and how it maps to minor frames."""
+    def get(n, default=None):
+        v = tm.get("P-%s\\IDC%d-1" % (p, n), tm.get("P-%s\\IDC%d" % (p, n), ""))
+        v = v.strip()
+        return v if v else default
+    word = get(1)
+    if word is None:
+        return None
+    wlen = int(get(2, fmt["word_bits"]))
+    msb = int(get(3, 1))                 # 1 = the word's most significant bit
+    bits = int(get(4, wlen))
+    first = int(get(6, 0))
+    end = get(8)
+    frames = fmt["frames"]
+    if frames <= 1 and end is not None:
+        frames = abs(int(end) - first) + 1
+    return {"word": int(word), "lsb": wlen - (msb - 1) - bits, "bits": bits, "first_value": first,
+            "frames": frames, "direction": -1 if get(10, "INC").upper().startswith("DEC") else 1}
 
 
 def tmats_definitions(pairs, log=lambda m: None):
@@ -200,18 +247,32 @@ def tmats_definitions(pairs, log=lambda m: None):
         link = tm.get("D-%s\\DLN" % x, "").strip()
         cid = chan_by_link.get(link)
         lt = tm.get("D-%s\\LT-%s-%s" % (x, y, n), "WDFR").strip().upper()
-        wp = tm.get("D-%s\\WP-%s-%s-1" % (x, y, n))
-        if cid is None or wp is None or lt != "WDFR":
+
+        def loc(key, m, x=x, y=y, n=n):
+            # location m, first fragment; older TMATS leaves out the fragment index
+            v = tm.get("D-%s\\%s-%s-%s-%d-1" % (x, key, y, n, m), tm.get("D-%s\\%s-%s-%s-%d" % (x, key, y, n, m)))
+            v = (v or "").strip()
+            return int(v) if v else None
+
+        nloc = int(tm.get("D-%s\\MML\\N-%s-%s" % (x, y, n), "1") or 1)
+        if cid is None or loc("WP", 1) is None or lt != "WDFR":
             log("TMATS measurement %s skipped (location type %s or no PCM link)." % (name, lt))
             continue
-        fp = int(tm.get("D-%s\\FP-%s-%s-1" % (x, y, n), "1") or 1)
-        fi = int(tm.get("D-%s\\FI-%s-%s-1" % (x, y, n), "0") or 0)
-        if fi > 1 or fp > 1:
-            log("TMATS measurement %s skipped: subcommutated words are not decoded yet." % name)
+        if any(int(tm.get("D-%s\\MNF\\N-%s-%s-%d" % (x, y, n, m), "1") or 1) > 1 for m in range(1, nloc + 1)):
+            log("TMATS measurement %s skipped: measurements split across several words are not decoded yet."
+                % name)
             continue
-        d = Definition(name=name, kind="pcm", channel=cid, word=int(wp),
-                       word_interval=int(tm.get("D-%s\\WI-%s-%s-1" % (x, y, n), "0") or 0), source="tmats")
-        mask = tm.get("D-%s\\WFM-%s-%s-1-1" % (x, y, n), "FW").strip().upper()
+        locations = []
+        for m in range(1, nloc + 1):
+            if loc("WP", m) is None:
+                continue
+            locations.append(dict(word=loc("WP", m), word_interval=loc("WI", m) or 0, end_word=loc("EWP", m),
+                                  frame=loc("FP", m), frame_interval=loc("FI", m) or 0,
+                                  end_frame=loc("EFP", m)))
+        first = locations[0]
+        d = Definition(name=name, kind="pcm", channel=cid, source="tmats", locations=locations, **first)
+        mask = tm.get("D-%s\\WFM-%s-%s-1-1" % (x, y, n), tm.get("D-%s\\WFM-%s-%s-1" % (x, y, n), "FW"))
+        mask = mask.strip().upper()
         if mask not in ("", "FW") and set(mask) <= {"0", "1"}:
             ones = [i for i, c in enumerate(reversed(mask)) if c == "1"]
             d.lsb, d.bits = min(ones), max(ones) - min(ones) + 1
@@ -454,15 +515,86 @@ def _frames_throughput(g, fmt, csdw, max_bits=1 << 27):
             break
 
 
+def _word_values(bits, fmt, wp):
+    """Bit offset and value of word position wp (1 = sync) in every minor frame, or None if outside."""
+    b0 = 0 if wp == 1 else fmt["sync_bits"] + (wp - 2) * fmt["word_bits"]
+    wl = fmt["sync_bits"] if wp == 1 else fmt["word_bits"]
+    if wp < 1 or b0 + wl > bits.shape[1]:
+        return b0, None
+    weights = np.uint64(1) << np.arange(wl - 1, -1, -1, dtype=np.uint64)
+    return b0, (bits[:, b0:b0 + wl].astype(np.uint64) * weights).sum(axis=1, dtype=np.uint64)
+
+
+def pcm_locations(d, fmt, frames_per_major):
+    """[(word positions, minor frame numbers or None for every frame)] for one PCM definition.
+
+    Supercommutation: a word repeated within the minor frame (word_interval, end_word).
+    Subcommutation: a word present only in some minor frames of the major frame
+    (frame, frame_interval, end_frame), numbered from 1.
+    """
+    locs = d.locations or [dict(word=d.word, word_interval=d.word_interval, end_word=d.end_word,
+                                frame=d.frame, frame_interval=d.frame_interval, end_frame=d.end_frame)]
+    out = []
+    for L in locs:
+        wi = L.get("word_interval") or 0
+        words = list(range(L["word"], (L.get("end_word") or fmt["words"]) + 1, wi)) if wi else [L["word"]]
+        f, fi, ef = L.get("frame"), L.get("frame_interval") or 0, L.get("end_frame")
+        n = frames_per_major or 0
+        if f is None or (f == 1 and fi <= 1 and not ef and n <= 1):
+            frames = None                                    # every minor frame
+        elif fi:
+            frames = list(range(f, (ef or n or f) + 1, fi))
+            if n > 1 and frames == list(range(1, n + 1)):
+                frames = None
+        else:
+            frames = [f]
+        out.append((words, frames))
+    return out
+
+
+def _sfid(d, fmt):
+    s = dict(fmt.get("sfid") or {})
+    s.update(d.sfid or {})
+    if "word" not in s:
+        return None
+    wl = fmt["sync_bits"] if s["word"] == 1 else fmt["word_bits"]
+    s.setdefault("lsb", 0)
+    s.setdefault("bits", wl - s["lsb"])
+    s.setdefault("first_value", 0)
+    s.setdefault("direction", 1)
+    if not s.get("frames") or s["frames"] <= 1:
+        s["frames"] = fmt.get("frames") if fmt.get("frames", 1) > 1 else 1 << s["bits"]
+    return s
+
+
+def _frame_numbers(bits, fmt, s):
+    """Minor frame number (1 = first of the major frame) of every frame, from the subframe ID counter."""
+    _b0, v = _word_values(bits, fmt, s["word"])
+    if v is None:
+        return None
+    v = ((v >> np.uint64(s["lsb"])) & np.uint64((1 << s["bits"]) - 1)).astype(np.int64)
+    return (v - s["first_value"]) * s["direction"] % s["frames"] + 1
+
+
 def extract_pcm(root, defs, formats, log):
     """All PCM definitions for one channel, sharing one pass over its frames."""
     results = {id(d): ([], []) for d in defs}
     cid = defs[0].channel
     fmt = formats.get(cid)
+    empty = {id(d): (np.zeros(0, np.int64), np.zeros(0, np.uint64)) for d in defs}
     if fmt is None:
         if any(True for _g in _channels(root, 0x09, cid)):
             log("PCM channel %s: no frame format in TMATS, so its measurements are skipped." % cid)
-        return {id(d): (np.zeros(0, np.int64), np.zeros(0, np.uint64)) for d in defs}, fmt
+        return empty, fmt
+    plans = {}
+    for d in defs:
+        s = _sfid(d, fmt)
+        plan = pcm_locations(d, fmt, s["frames"] if s else fmt.get("frames", 1))
+        if s is None and any(fr is not None for _w, fr in plan):
+            log("Measurement %s (%s) is subcommutated, but channel %s has no subframe ID counter "
+                "(TMATS P-d\\IDC keys, or the sfid_word column), so it is skipped." % (d.name, d.selector(), cid))
+            plan = []
+        plans[id(d)] = (s, plan)
     for g in _channels(root, 0x09, cid):
         pk = g["packets"]
         if not len(pk):
@@ -472,19 +604,25 @@ def extract_pcm(root, defs, formats, log):
         frames = _frames_iph(g, fmt, csdw) if has_frames else _frames_throughput(g, fmt, csdw)
         ns_per_bit = 1e9 / fmt["bit_rate"] if fmt["bit_rate"] else 0.0
         for t, bits in frames:
-            weights = 1 << np.arange(63, -1, -1, dtype=np.uint64)
+            fnums = {}
             for d in defs:
-                positions = [d.word]
-                if d.word_interval:
-                    positions = list(range(d.word, fmt["words"] + 1, d.word_interval))
-                for wp in positions:
-                    b0 = 0 if wp == 1 else fmt["sync_bits"] + (wp - 2) * fmt["word_bits"]
-                    wl = fmt["sync_bits"] if wp == 1 else fmt["word_bits"]
-                    if b0 + wl > bits.shape[1]:
-                        continue
-                    word = (bits[:, b0:b0 + wl].astype(np.uint64) * weights[64 - wl:]).sum(axis=1).astype(np.uint64)
-                    results[id(d)][0].append(t + int(b0 * ns_per_bit))
-                    results[id(d)][1].append(word)
+                s, plan = plans[id(d)]
+                for words, frame_set in plan:
+                    if frame_set is None:
+                        sel = slice(None)
+                    else:
+                        key = tuple(sorted(s.items()))
+                        if key not in fnums:
+                            fnums[key] = _frame_numbers(bits, fmt, s)
+                        if fnums[key] is None:
+                            continue
+                        sel = np.isin(fnums[key], frame_set)
+                    for wp in words:
+                        b0, word = _word_values(bits, fmt, wp)
+                        if word is None:
+                            continue
+                        results[id(d)][0].append(t[sel] + int(b0 * ns_per_bit))
+                        results[id(d)][1].append(word[sel])
     out = {}
     for d in defs:
         out[id(d)] = _join(*results[id(d)])
@@ -508,13 +646,20 @@ def _safe(name, used):
 
 
 def observed_rate(t):
-    """Typical sample rate in Hz from the median spacing of the time stamps."""
+    """Average sample rate in Hz while data is flowing.
+
+    Spacings longer than max(1 s, 20 x the median spacing) are treated as recording
+    gaps and left out. An average rather than the median, so that a supercommutated
+    word (several samples bunched in each minor frame) reports its true rate.
+    """
     t = t[t >= 0]
     if len(t) < 2:
         return 0.0
-    dt = np.diff(np.sort(t))
-    dt = dt[dt > 0]
-    return float(1e9 / np.median(dt)) if len(dt) else 0.0
+    dt = np.diff(np.sort(t)).astype(np.float64)
+    if not (dt > 0).any():
+        return 0.0
+    dt = dt[dt <= max(1e9, 20 * np.median(dt[dt > 0]))]
+    return float(len(dt) * 1e9 / dt.sum()) if dt.sum() > 0 else 0.0
 
 
 def combine(series):
